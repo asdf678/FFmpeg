@@ -79,13 +79,15 @@
 
 #include "cmdutils.h"
 #include "ffmpeg.h"
+#include "ffmpeg_api.h"
 #include "ffmpeg_sched.h"
 #include "ffmpeg_utils.h"
 
 const char program_name[] = "ffmpeg";
 const int program_birth_year = 2000;
 
-FILE *vstats_file;
+/* Thread-local: see ffmpeg.h / ffmpeg_api.h for the rationale. */
+_Thread_local FILE *vstats_file;
 
 typedef struct BenchmarkTimeStamps {
     int64_t real_usec;
@@ -96,22 +98,22 @@ typedef struct BenchmarkTimeStamps {
 static BenchmarkTimeStamps get_benchmark_time_stamps(void);
 static int64_t getmaxrss(void);
 
-atomic_uint nb_output_dumped = 0;
+_Thread_local atomic_uint nb_output_dumped = 0;
 
-static BenchmarkTimeStamps current_time;
-AVIOContext *progress_avio = NULL;
+static _Thread_local BenchmarkTimeStamps current_time;
+_Thread_local AVIOContext *progress_avio = NULL;
 
-InputFile   **input_files   = NULL;
-int        nb_input_files   = 0;
+_Thread_local InputFile   **input_files   = NULL;
+_Thread_local int            nb_input_files   = 0;
 
-OutputFile   **output_files   = NULL;
-int         nb_output_files   = 0;
+_Thread_local OutputFile   **output_files   = NULL;
+_Thread_local int            nb_output_files   = 0;
 
-FilterGraph **filtergraphs;
-int        nb_filtergraphs;
+_Thread_local FilterGraph **filtergraphs;
+_Thread_local int            nb_filtergraphs;
 
-Decoder     **decoders;
-int        nb_decoders;
+_Thread_local Decoder     **decoders;
+_Thread_local int            nb_decoders;
 
 #if HAVE_TERMIOS_H
 
@@ -134,11 +136,21 @@ void term_exit(void)
     term_exit_sigsafe();
 }
 
+/*
+ * received_sigterm / received_nb_signals stay process-wide because the
+ * POSIX signal mechanism delivers the signal to one arbitrary thread and
+ * the value must be observable from any worker. They are only consumed by
+ * the legacy main()/CLI driver. Worker tasks driven from ffmpeg_api.h use
+ * the per-task cancel flag instead (see ffmpeg_task_cancel()).
+ *
+ * transcode_init_done becomes thread-local: each task tracks its own
+ * "init complete" state for its own decode_interrupt_cb.
+ */
 static volatile int received_sigterm = 0;
 static volatile int received_nb_signals = 0;
-static atomic_int transcode_init_done = 0;
+static _Thread_local atomic_int transcode_init_done = 0;
 static volatile int ffmpeg_exited = 0;
-static int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
+static _Thread_local int64_t copy_ts_first_pts = AV_NOPTS_VALUE;
 
 static void
 sigterm_handler(int sig)
@@ -301,6 +313,11 @@ static int read_key(void)
 
 static int decode_interrupt_cb(void *ctx)
 {
+    /* Honor either the global signal counter (CLI/main) or the per-task
+     * cooperative cancel flag (ffmpeg_api worker threads). */
+    FFmpegTask *task = ffmpeg_task_current();
+    if (task && ffmpeg_task_is_cancelled(task))
+        return 1;
     return received_nb_signals > atomic_load(&transcode_init_done);
 }
 
@@ -316,6 +333,7 @@ static void ffmpeg_cleanup(int ret)
     for (int i = 0; i < nb_filtergraphs; i++)
         fg_free(&filtergraphs[i]);
     av_freep(&filtergraphs);
+    nb_filtergraphs = 0;
 
     for (int i = 0; i < nb_output_files; i++)
         of_free(&output_files[i]);
@@ -326,12 +344,14 @@ static void ffmpeg_cleanup(int ret)
     for (int i = 0; i < nb_decoders; i++)
         dec_free(&decoders[i]);
     av_freep(&decoders);
+    nb_decoders = 0;
 
     if (vstats_file) {
         if (fclose(vstats_file))
             av_log(NULL, AV_LOG_ERROR,
                    "Error closing vstats file, loss of information possible: %s\n",
                    av_err2str(AVERROR(errno)));
+        vstats_file = NULL;
     }
     av_freep(&vstats_filename);
     of_enc_stats_close();
@@ -342,6 +362,8 @@ static void ffmpeg_cleanup(int ret)
 
     av_freep(&input_files);
     av_freep(&output_files);
+    nb_input_files  = 0;
+    nb_output_files = 0;
 
     uninit_opts();
 
@@ -355,6 +377,42 @@ static void ffmpeg_cleanup(int ret)
     }
     term_exit();
     ffmpeg_exited = 1;
+}
+
+/*
+ * Reset the per-task TLS state between successive runs on the same worker
+ * thread. Without this the second task would inherit option values left over
+ * from the first.
+ */
+void ffmpeg_state_reset(void)
+{
+    /* tables (already freed by ffmpeg_cleanup; defensively NULL) */
+    input_files = NULL;       nb_input_files = 0;
+    output_files = NULL;      nb_output_files = 0;
+    filtergraphs = NULL;      nb_filtergraphs = 0;
+    decoders = NULL;          nb_decoders = 0;
+
+    progress_avio = NULL;
+    vstats_file = NULL;
+    vstats_filename = NULL;
+    filter_hw_device = NULL;
+    filter_nbthreads = NULL;
+
+    /* progress / report counters */
+    atomic_store(&nb_output_dumped, 0u);
+    atomic_store(&transcode_init_done, 0);
+    copy_ts_first_pts = AV_NOPTS_VALUE;
+
+    /* TLS option defaults */
+#if FFMPEG_OPT_VSYNC
+    video_sync_method          = VSYNC_AUTO;
+#endif
+    abort_on_flags             = 0;
+    stats_period               = 500000;
+    /* The process-wide options below (print_stats, do_benchmark, ...) are
+     * shared across worker threads; they are owned by the option-parsing
+     * stage which is serialized via g_engine_options_mutex in ffmpeg_api.c.
+     * They are NOT reset here. */
 }
 
 OutputStream *ost_iter(OutputStream *prev)
@@ -552,26 +610,46 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
     int vid;
     double bitrate;
     double speed;
-    static int64_t last_time = -1;
-    static int first_report = 1;
+    /* Thread-local because several tasks may run print_report concurrently. */
+    static _Thread_local int64_t last_time = -1;
+    static _Thread_local int64_t last_cb_time = -1;
+    static _Thread_local int first_report = 1;
     uint64_t nb_frames_dup = 0, nb_frames_drop = 0;
     int mins, secs, us;
     int64_t hours;
     const char *hours_sign;
     int ret;
     float t;
+    /* Whether the embedding API wants a callback this round (~1Hz). */
+    int notify_cb = 0;
+    FFmpegTask *cb_task = ffmpeg_task_current();
 
-    if (!print_stats && !is_last_report && !progress_avio)
+    if (cb_task) {
+        if (last_cb_time < 0 || is_last_report ||
+            (cur_time - last_cb_time) >= 1000000) {
+            notify_cb = 1;
+            last_cb_time = cur_time;
+        }
+    }
+
+    if (!print_stats && !is_last_report && !progress_avio && !notify_cb)
         return;
 
     if (!is_last_report) {
         if (last_time == -1) {
             last_time = cur_time;
         }
-        if (((cur_time - last_time) < stats_period && !first_report) ||
-            (first_report && atomic_load(&nb_output_dumped) < nb_output_files))
-            return;
-        last_time = cur_time;
+        /* If only the API callback wants this round, skip the stats-period
+         * gate but still throttle text/AVIO output below by checking
+         * print_stats/progress_avio flags. */
+        if (!notify_cb) {
+            if ((cur_time - last_time) < stats_period && !first_report)
+                return;
+            if (first_report && atomic_load(&nb_output_dumped) < nb_output_files)
+                return;
+        }
+        if ((cur_time - last_time) >= stats_period || first_report)
+            last_time = cur_time;
     }
 
     t = (cur_time-timer_start) / 1000000.0;
@@ -692,6 +770,40 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
                 av_log(NULL, AV_LOG_ERROR,
                        "Error closing progress log, loss of information possible: %s\n", av_err2str(ret));
         }
+    } else {
+        av_bprint_finalize(&buf_script, NULL);
+    }
+
+    /* Fire the per-task progress callback if one is registered. */
+    if (cb_task && notify_cb) {
+        FFmpegProgress p = {
+            .task_id      = 0,
+            .stage        = is_last_report ? FFMPEG_STAGE_FINAL :
+                            (first_report  ? FFMPEG_STAGE_INIT  :
+                                              FFMPEG_STAGE_RUNNING),
+            .elapsed_us   = cur_time - timer_start,
+            .pts_us       = pts,
+            .total_size   = total_size,
+            .frame_number = 0,
+            .fps          = 0.0,
+            .bitrate_kbps = bitrate,
+            .speed        = speed,
+            .quality      = 0.0f,
+            .dup_frames   = nb_frames_dup,
+            .drop_frames  = nb_frames_drop,
+        };
+
+        for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+            if (ost->type == AVMEDIA_TYPE_VIDEO) {
+                p.frame_number = atomic_load(&ost->packets_written);
+                p.fps          = t > 1.0f ? p.frame_number / t : 0.0;
+                p.quality      = ost->enc ?
+                    atomic_load(&ost->quality) / (float)FF_QP2LAMBDA : -1.0f;
+                break;
+            }
+        }
+
+        ffmpeg_task_emit_progress(&p);
     }
 
     first_report = 0;
@@ -854,6 +966,7 @@ static int transcode(Scheduler *sch)
 {
     int ret = 0;
     int64_t timer_start, transcode_ts = 0;
+    FFmpegTask *task = ffmpeg_task_current();
 
     print_stream_maps();
 
@@ -873,6 +986,10 @@ static int transcode(Scheduler *sch)
         int64_t cur_time= av_gettime_relative();
 
         if (received_nb_signals)
+            break;
+
+        /* worker tasks may be cancelled cooperatively */
+        if (task && ffmpeg_task_is_cancelled(task))
             break;
 
         /* if 'q' pressed, exits */
@@ -896,6 +1013,9 @@ static int transcode(Scheduler *sch)
 
     /* dump report by using the first video and audio streams */
     print_report(1, timer_start, av_gettime_relative(), transcode_ts);
+
+    if (ret < 0)
+        ffmpeg_task_emit_error(ret, "transcode failed");
 
     return ret;
 }
@@ -944,24 +1064,21 @@ static int64_t getmaxrss(void)
 #endif
 }
 
-int main(int argc, char **argv)
+/*
+ * The body of main(). Re-entrant and thread-safe to call from any worker
+ * thread (see fftools/ffmpeg_api.h). The caller is responsible for invoking
+ * ffmpeg_state_reset() before each call when running multiple tasks on the
+ * same thread.
+ */
+int ffmpeg_run(int argc, char **argv)
 {
     Scheduler *sch = NULL;
 
     int ret;
     BenchmarkTimeStamps ti;
 
-    init_dynload();
-
-    setvbuf(stderr,NULL,_IONBF,0); /* win32 runtime needs this */
-
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
     parse_loglevel(argc, argv, options);
-
-#if CONFIG_AVDEVICE
-    avdevice_register_all();
-#endif
-    avformat_network_init();
 
     show_banner(argc, argv, options);
 
@@ -971,8 +1088,20 @@ int main(int argc, char **argv)
         goto finish;
     }
 
-    /* parse options and open all input/output files */
+    /*
+     * Phase 1 — option parsing: serialized.
+     *
+     * The options[] table directly addresses a handful of process-wide
+     * variables (do_benchmark, print_stats, ...) so concurrent invocations
+     * of this section would race. Hold g_options_mutex for the duration of
+     * parsing, then snapshot the resulting values into thread-local copies
+     * the rest of ffmpeg_run() (and transcode) will read from.
+     */
+    ffmpeg_options_lock();
     ret = ffmpeg_parse_options(argc, argv, sch);
+    if (ret >= 0)
+        ffmpeg_snapshot_opts_to_tls();
+    ffmpeg_options_unlock();
     if (ret < 0)
         goto finish;
 
@@ -1009,9 +1138,34 @@ finish:
     if (ret == AVERROR_EXIT)
         ret = 0;
 
+    if (ret < 0)
+        ffmpeg_task_emit_error(ret, "ffmpeg_run failed");
+
     ffmpeg_cleanup(ret);
 
     sch_free(&sch);
 
     return ret;
 }
+
+/*
+ * The CLI entry point. Compile with -DFFMPEG_DRIVER_NO_MAIN to omit it when
+ * embedding the engine into another program that supplies its own main()
+ * (see fftools/ffmpeg_api_demo.c).
+ */
+#ifndef FFMPEG_DRIVER_NO_MAIN
+int main(int argc, char **argv)
+{
+    init_dynload();
+
+    setvbuf(stderr, NULL, _IONBF, 0); /* win32 runtime needs this */
+
+#if CONFIG_AVDEVICE
+    avdevice_register_all();
+#endif
+    avformat_network_init();
+
+    /* CLI driver: keep the legacy interactive defaults, then run once. */
+    return ffmpeg_run(argc, argv);
+}
+#endif /* FFMPEG_DRIVER_NO_MAIN */

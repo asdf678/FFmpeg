@@ -1,0 +1,50 @@
+---
+description: FFmpeg 7.1 工程结构与模块说明
+alwaysApply: true
+---
+
+# FFmpeg 工程概览
+
+本工作区为 **FFmpeg 7.1.4**（代号 "Péter"）完整源码树，当前分支 **`dev7`**（7.x 开发线，近期侧重 VVC/H.266 解码修复）。
+
+FFmpeg 是开源多媒体处理框架，提供 C 库与命令行工具，用于编解码、封装、滤镜、流式传输等。
+
+## 核心库
+
+| 库 | 职责 |
+|---|---|
+| `libavcodec` | 编解码器（最大模块，含多平台 SIMD 优化） |
+| `libavformat` | 容器格式与流媒体协议 |
+| `libavutil` | 通用工具函数 |
+| `libavfilter` | 滤镜图处理 |
+| `libavdevice` | 采集/播放设备 |
+| `libswresample` | 音频重采样 |
+| `libswscale` | 图像缩放与色彩转换 |
+| `libpostproc` | 后处理（遗留模块） |
+
+## 命令行工具（`fftools/`）
+
+- `ffmpeg` — 转码/封装/滤镜/推流
+- `ffplay` — 播放器
+- `ffprobe` — 媒体分析
+
+## 关键目录
+
+- `doc/examples/` — API 编码示例
+- `tests/` — FATE 测试
+- `build/` — out-of-tree 构建产物（勿与源码混淆）
+- `install/` — 本地安装前缀
+
+## 分支
+
+| 分支 | 说明 |
+|---|---|
+| `dev7` | 当前开发分支 |
+| `master` | 主开发线 |
+| `release/5.1` / `release/6.0` | 稳定版维护 |
+
+## 许可
+
+主体 LGPL，当前构建启用 GPL v3+。上游通过 ffmpeg-devel 邮件列表收补丁。
+
+完整说明见根目录 `PROJECT.md`。

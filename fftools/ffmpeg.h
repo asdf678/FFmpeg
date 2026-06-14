@@ -694,61 +694,148 @@ typedef struct FrameData {
     AVCodecParameters *par_enc;
 } FrameData;
 
-extern InputFile   **input_files;
-extern int        nb_input_files;
+/*
+ * Per-transcode state. Three flavours are mixed here:
+ *
+ *   1) _Thread_local globals
+ *      Used for things only assigned via opt_* helpers or at runtime,
+ *      plus all dynamic tables. One copy per worker thread.
+ *
+ *   2) Plain process globals
+ *      Referenced by their address from the options[] static initializer
+ *      table; their addresses must be compile-time constants. Written only
+ *      during ffmpeg_parse_options(), which is serialized via
+ *      g_options_mutex (see ffmpeg.c). Defined in ffmpeg_opt.c with the
+ *      original names (do_benchmark, print_stats, ...).
+ *
+ *   3) _Thread_local "snapshot" copies of the (2) variables.
+ *      Filled by ffmpeg_snapshot_opts_to_tls() right after
+ *      parse_options() finishes, then read freely from the lock-free
+ *      transcode loop. The header below uses the preprocessor to
+ *      transparently redirect every reader of e.g. `print_stats` to
+ *      `print_stats_tls`. ffmpeg_opt.c defines FFMPEG_RAW_GLOBALS before
+ *      including this header so the option table and snapshot routine
+ *      still see the underlying process-wide variables.
+ *
+ *      Net effect: parse_options is short and serialized, but transcode
+ *      runs fully concurrent across worker threads.
+ *
+ * See fftools/ffmpeg_api.h for the embedding-side rules.
+ */
+extern _Thread_local InputFile   **input_files;
+extern _Thread_local int            nb_input_files;
 
-extern OutputFile   **output_files;
-extern int         nb_output_files;
+extern _Thread_local OutputFile   **output_files;
+extern _Thread_local int            nb_output_files;
 
 // complex filtergraphs
-extern FilterGraph **filtergraphs;
-extern int        nb_filtergraphs;
+extern _Thread_local FilterGraph **filtergraphs;
+extern _Thread_local int            nb_filtergraphs;
 
 // standalone decoders (not tied to demuxed streams)
-extern Decoder     **decoders;
-extern int        nb_decoders;
+extern _Thread_local Decoder     **decoders;
+extern _Thread_local int            nb_decoders;
 
-extern char *vstats_filename;
+extern _Thread_local char *vstats_filename;
 
+/* (2) process-wide originals + (3) thread-local snapshots */
 extern float dts_delta_threshold;
 extern float dts_error_threshold;
-
-extern enum VideoSyncMethod video_sync_method;
 extern float frame_drop_threshold;
-extern int do_benchmark;
-extern int do_benchmark_all;
-extern int do_hex_dump;
-extern int do_pkt_dump;
-extern int copy_ts;
-extern int start_at_zero;
-extern int copy_tb;
-extern int debug_ts;
-extern int exit_on_error;
-extern int abort_on_flags;
-extern int print_stats;
-extern int64_t stats_period;
-extern int stdin_interaction;
-extern AVIOContext *progress_avio;
+extern int   do_benchmark;
+extern int   do_benchmark_all;
+extern int   do_hex_dump;
+extern int   do_pkt_dump;
+extern int   copy_ts;
+extern int   start_at_zero;
+extern int   copy_tb;
+extern int   debug_ts;
+extern int   exit_on_error;
+extern int   print_stats;
+extern int   stdin_interaction;
 extern float max_error_rate;
+extern int   filter_complex_nbthreads;
+extern int   vstats_version;
+extern int   auto_conversion_filters;
+extern int   ignore_unknown_streams;
+extern int   copy_unknown_streams;
+extern int   recast_media;
 
-extern char *filter_nbthreads;
-extern int filter_complex_nbthreads;
-extern int vstats_version;
-extern int auto_conversion_filters;
+extern _Thread_local float dts_delta_threshold_tls;
+extern _Thread_local float dts_error_threshold_tls;
+extern _Thread_local float frame_drop_threshold_tls;
+extern _Thread_local int   do_benchmark_tls;
+extern _Thread_local int   do_benchmark_all_tls;
+extern _Thread_local int   do_hex_dump_tls;
+extern _Thread_local int   do_pkt_dump_tls;
+extern _Thread_local int   copy_ts_tls;
+extern _Thread_local int   start_at_zero_tls;
+extern _Thread_local int   copy_tb_tls;
+extern _Thread_local int   debug_ts_tls;
+extern _Thread_local int   exit_on_error_tls;
+extern _Thread_local int   print_stats_tls;
+extern _Thread_local int   stdin_interaction_tls;
+extern _Thread_local float max_error_rate_tls;
+extern _Thread_local int   filter_complex_nbthreads_tls;
+extern _Thread_local int   vstats_version_tls;
+extern _Thread_local int   auto_conversion_filters_tls;
+extern _Thread_local int   ignore_unknown_streams_tls;
+extern _Thread_local int   copy_unknown_streams_tls;
+extern _Thread_local int   recast_media_tls;
+
+/* Transparent redirection: every translation unit that does not define
+ * FFMPEG_RAW_GLOBALS (i.e. everyone except ffmpeg_opt.c) reads/writes the
+ * thread-local snapshot. */
+#ifndef FFMPEG_RAW_GLOBALS
+#define dts_delta_threshold        dts_delta_threshold_tls
+#define dts_error_threshold        dts_error_threshold_tls
+#define frame_drop_threshold       frame_drop_threshold_tls
+#define do_benchmark               do_benchmark_tls
+#define do_benchmark_all           do_benchmark_all_tls
+#define do_hex_dump                do_hex_dump_tls
+#define do_pkt_dump                do_pkt_dump_tls
+#define copy_ts                    copy_ts_tls
+#define start_at_zero              start_at_zero_tls
+#define copy_tb                    copy_tb_tls
+#define debug_ts                   debug_ts_tls
+#define exit_on_error              exit_on_error_tls
+#define print_stats                print_stats_tls
+#define stdin_interaction          stdin_interaction_tls
+#define max_error_rate             max_error_rate_tls
+#define filter_complex_nbthreads   filter_complex_nbthreads_tls
+#define vstats_version             vstats_version_tls
+#define auto_conversion_filters    auto_conversion_filters_tls
+#define ignore_unknown_streams     ignore_unknown_streams_tls
+#define copy_unknown_streams       copy_unknown_streams_tls
+#define recast_media               recast_media_tls
+#endif /* !FFMPEG_RAW_GLOBALS */
+
+/*
+ * Snapshot the process-wide option globals into the thread-local copies.
+ * Must be called once per ffmpeg_run() right after parse_options(), while
+ * the option-parsing mutex is still held.
+ */
+void ffmpeg_snapshot_opts_to_tls(void);
+
+/* Lock helpers around the option-parsing critical section. */
+void ffmpeg_options_lock  (void);
+void ffmpeg_options_unlock(void);
+
+extern _Thread_local enum VideoSyncMethod video_sync_method;
+extern _Thread_local int abort_on_flags;
+extern _Thread_local int64_t stats_period;
+extern _Thread_local AVIOContext *progress_avio;
+
+extern _Thread_local char *filter_nbthreads;
 
 extern const AVIOInterruptCB int_cb;
 
 extern const OptionDef options[];
-extern HWDevice *filter_hw_device;
+extern _Thread_local HWDevice *filter_hw_device;
 
-extern atomic_uint nb_output_dumped;
+extern _Thread_local atomic_uint nb_output_dumped;
 
-extern int ignore_unknown_streams;
-extern int copy_unknown_streams;
-
-extern int recast_media;
-
-extern FILE *vstats_file;
+extern _Thread_local FILE *vstats_file;
 
 void term_init(void);
 void term_exit(void);
@@ -920,5 +1007,15 @@ int view_specifier_parse(const char **pspec, ViewSpecifier *vs);
 
 int muxer_thread(void *arg);
 int encoder_thread(void *arg);
+
+/* ----------------------------------------------------------------------------
+ * Embeddable engine entry points (see ffmpeg_api.h for the public API).
+ * ffmpeg_run() implements the body that traditionally lived in main(); it can
+ * be called from any thread. ffmpeg_state_reset() is invoked between tasks on
+ * the same worker thread to clear stale TLS option/state values left over from
+ * a previous run.
+ * --------------------------------------------------------------------------*/
+int  ffmpeg_run(int argc, char **argv);
+void ffmpeg_state_reset(void);
 
 #endif /* FFTOOLS_FFMPEG_H */

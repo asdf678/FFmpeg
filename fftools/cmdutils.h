@@ -44,9 +44,16 @@ extern const char program_name[];
  */
 extern const int program_birth_year;
 
-extern AVDictionary *sws_dict;
-extern AVDictionary *swr_opts;
-extern AVDictionary *format_opts, *codec_opts;
+/*
+ * Per-task option dictionaries. Marked _Thread_local so multiple ffmpeg /
+ * ffprobe pipelines may run concurrently in the same process without
+ * stepping on each other's option state. The handful of remaining
+ * process-wide option globals are protected by a short critical section
+ * inside ffmpeg_run() / ffprobe_run() (see ffmpeg.h / ffprobe.c).
+ */
+extern _Thread_local AVDictionary *sws_dict;
+extern _Thread_local AVDictionary *swr_opts;
+extern _Thread_local AVDictionary *format_opts, *codec_opts;
 extern int hide_banner;
 
 /**

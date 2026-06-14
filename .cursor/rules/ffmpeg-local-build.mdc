@@ -1,0 +1,37 @@
+---
+description: FFmpeg 本地构建与开发工作流
+alwaysApply: true
+---
+
+# 本地构建配置
+
+采用 **out-of-tree** 构建：源码在仓库根目录，产物在 `build/`，安装到 `install/`。
+
+| 项 | 值 |
+|---|---|
+| 安装前缀 | `/home/tzy/source/FFmpeg/install` |
+| 配置选项 | `--enable-gpl --enable-version3 --enable-shared --enable-debug=3` |
+| 平台 | Linux x86_64，GCC 11 (Ubuntu 22.04) |
+| 可执行文件 | `install/bin/ffmpeg`、`ffplay`、`ffprobe` |
+
+## 构建命令
+
+```bash
+# 配置（在仓库根目录执行，输出到 build/）
+./configure --prefix=/home/tzy/source/FFmpeg/install \
+            --enable-gpl --enable-version3 --enable-shared --enable-debug=3
+
+# 编译与安装
+make -C build -j$(nproc)
+make -C build install
+
+# 运行
+./install/bin/ffmpeg -i input.mp4 output.mkv
+```
+
+## 开发注意
+
+- 修改源码后需在 `build/` 目录重新 `make`，必要时 `make install`
+- `build/config.h` 记录当前 configure 结果，排查编译选项时可参考
+- 非系统依赖（如 libx264）默认关闭，需显式 `--enable-*` 开启
+- 不要提交 `build/`、`install/`、`.idea/` 等本地产物

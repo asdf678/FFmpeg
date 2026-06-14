@@ -10,6 +10,7 @@ ALLAVPROGS   = $(AVBASENAMES:%=%$(PROGSSUF)$(EXESUF))
 ALLAVPROGS_G = $(AVBASENAMES:%=%$(PROGSSUF)_g$(EXESUF))
 
 OBJS-ffmpeg +=                  \
+    fftools/ffmpeg_api.o        \
     fftools/ffmpeg_dec.o        \
     fftools/ffmpeg_demux.o      \
     fftools/ffmpeg_enc.o        \
@@ -24,6 +25,8 @@ OBJS-ffmpeg +=                  \
     fftools/thread_queue.o      \
 
 OBJS-ffplay += fftools/ffplay_renderer.o
+
+OBJS-ffprobe += fftools/ffprobe_api.o
 
 define DOFFTOOL
 OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)

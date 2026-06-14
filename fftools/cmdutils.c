@@ -53,9 +53,9 @@
 #include "compat/w32dlfcn.h"
 #endif
 
-AVDictionary *sws_dict;
-AVDictionary *swr_opts;
-AVDictionary *format_opts, *codec_opts;
+_Thread_local AVDictionary *sws_dict;
+_Thread_local AVDictionary *swr_opts;
+_Thread_local AVDictionary *format_opts, *codec_opts;
 
 int hide_banner = 0;
 

@@ -20,12 +20,18 @@
 
 #include "config.h"
 
+#include <pthread.h>
 #include <stdint.h>
 
 #if HAVE_SYS_RESOURCE_H
 #include <sys/time.h>
 #include <sys/resource.h>
 #endif
+
+/* See ffmpeg.h: this translation unit owns the canonical (process-wide)
+ * option globals that the static options[] table binds to. Suppress the
+ * thread-local redirection used by every other translation unit. */
+#define FFMPEG_RAW_GLOBALS 1
 
 #include "ffmpeg.h"
 #include "ffmpeg_sched.h"
@@ -48,17 +54,30 @@
 #include "libavutil/parseutils.h"
 #include "libavutil/stereo3d.h"
 
-HWDevice *filter_hw_device;
+/*
+ * State classes (see ffmpeg.h header comment for the full picture):
+ *
+ *   (1) Pure thread-locals, assigned via opt_* helpers / runtime.
+ *   (2) Process-wide originals — addressed by options[] and by the
+ *       snapshot routine below. Written under g_options_mutex.
+ *   (3) _Thread_local snapshot copies of (2). All consumers outside this
+ *       file see them transparently via the macros in ffmpeg.h.
+ */
 
-char *vstats_filename;
+/* (1) thread-local: assigned through opt_* helpers / runtime only. */
+_Thread_local HWDevice *filter_hw_device;
+_Thread_local char *vstats_filename;
+_Thread_local float audio_drift_threshold = 0.1;
+#if FFMPEG_OPT_VSYNC
+_Thread_local enum VideoSyncMethod video_sync_method = VSYNC_AUTO;
+#endif
+_Thread_local int abort_on_flags    = 0;
+_Thread_local char *filter_nbthreads;
+_Thread_local int64_t stats_period = 500000;
 
-float audio_drift_threshold = 0.1;
+/* (2) process-wide originals (referenced by options[] static initializers). */
 float dts_delta_threshold   = 10;
 float dts_error_threshold   = 3600*30;
-
-#if FFMPEG_OPT_VSYNC
-enum VideoSyncMethod video_sync_method = VSYNC_AUTO;
-#endif
 float frame_drop_threshold = 0;
 int do_benchmark      = 0;
 int do_benchmark_all  = 0;
@@ -69,22 +88,73 @@ int start_at_zero     = 0;
 int copy_tb           = -1;
 int debug_ts          = 0;
 int exit_on_error     = 0;
-int abort_on_flags    = 0;
 int print_stats       = -1;
 int stdin_interaction = 1;
 float max_error_rate  = 2.0/3;
-char *filter_nbthreads;
 int filter_complex_nbthreads = 0;
 int vstats_version = 2;
 int auto_conversion_filters = 1;
-int64_t stats_period = 500000;
-
 
 static int file_overwrite     = 0;
 static int no_file_overwrite  = 0;
 int ignore_unknown_streams = 0;
 int copy_unknown_streams = 0;
 int recast_media = 0;
+
+/* (3) thread-local snapshots of (2). Initial values mirror the originals so
+ *     a worker that never calls parse_options still observes sane defaults. */
+_Thread_local float dts_delta_threshold_tls   = 10;
+_Thread_local float dts_error_threshold_tls   = 3600*30;
+_Thread_local float frame_drop_threshold_tls  = 0;
+_Thread_local int   do_benchmark_tls          = 0;
+_Thread_local int   do_benchmark_all_tls      = 0;
+_Thread_local int   do_hex_dump_tls           = 0;
+_Thread_local int   do_pkt_dump_tls           = 0;
+_Thread_local int   copy_ts_tls               = 0;
+_Thread_local int   start_at_zero_tls         = 0;
+_Thread_local int   copy_tb_tls               = -1;
+_Thread_local int   debug_ts_tls              = 0;
+_Thread_local int   exit_on_error_tls         = 0;
+_Thread_local int   print_stats_tls           = -1;
+_Thread_local int   stdin_interaction_tls     = 1;
+_Thread_local float max_error_rate_tls        = 2.0/3;
+_Thread_local int   filter_complex_nbthreads_tls = 0;
+_Thread_local int   vstats_version_tls        = 2;
+_Thread_local int   auto_conversion_filters_tls = 1;
+_Thread_local int   ignore_unknown_streams_tls = 0;
+_Thread_local int   copy_unknown_streams_tls   = 0;
+_Thread_local int   recast_media_tls           = 0;
+
+/* Process-wide mutex protecting the option-parsing critical section. */
+static pthread_mutex_t g_options_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void ffmpeg_options_lock(void)   { pthread_mutex_lock  (&g_options_mutex); }
+void ffmpeg_options_unlock(void) { pthread_mutex_unlock(&g_options_mutex); }
+
+void ffmpeg_snapshot_opts_to_tls(void)
+{
+    dts_delta_threshold_tls       = dts_delta_threshold;
+    dts_error_threshold_tls       = dts_error_threshold;
+    frame_drop_threshold_tls      = frame_drop_threshold;
+    do_benchmark_tls              = do_benchmark;
+    do_benchmark_all_tls          = do_benchmark_all;
+    do_hex_dump_tls               = do_hex_dump;
+    do_pkt_dump_tls               = do_pkt_dump;
+    copy_ts_tls                   = copy_ts;
+    start_at_zero_tls             = start_at_zero;
+    copy_tb_tls                   = copy_tb;
+    debug_ts_tls                  = debug_ts;
+    exit_on_error_tls             = exit_on_error;
+    print_stats_tls               = print_stats;
+    stdin_interaction_tls         = stdin_interaction;
+    max_error_rate_tls            = max_error_rate;
+    filter_complex_nbthreads_tls  = filter_complex_nbthreads;
+    vstats_version_tls            = vstats_version;
+    auto_conversion_filters_tls   = auto_conversion_filters;
+    ignore_unknown_streams_tls    = ignore_unknown_streams;
+    copy_unknown_streams_tls      = copy_unknown_streams;
+    recast_media_tls              = recast_media;
+}
 
 static void uninit_options(OptionsContext *o)
 {

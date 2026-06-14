@@ -1,0 +1,31 @@
+---
+description: FFmpeg C 源码修改约定
+globs: "{libav*,fftools,tools}/**/*.{c,h}"
+alwaysApply: false
+---
+
+# FFmpeg 编码约定
+
+修改 `libav*`、`fftools/`、`tools/` 下的 C 代码时遵循以下原则：
+
+## 风格
+
+- 遵循 FFmpeg 既有风格：4 空格缩进、K&R 风格函数括号、snake_case 命名
+- 复用 `libavutil` 工具（`av_malloc`、`av_log`、`AVERROR` 等），不要引入外部依赖
+- 错误处理：函数返回负的 `AVERROR` 码，调用方检查返回值
+
+## 修改范围
+
+- 最小化 diff，不改动无关代码
+- 新功能需配套 FATE 测试（`tests/`）或 fate 样本
+- 编解码器改动注意 CBS（Coded Bitstream）层与解码器层一致性
+
+## 当前分支重点
+
+`dev7` 近期变更集中在 **VVC/H.266**（`libavcodec/vvc/`、`cbs_h266*`），涉及语法模板与解码器健壮性修复。
+
+## 参考
+
+- 离线文档：`doc/`
+- API 示例：`doc/examples/`
+- 贡献流程：补丁发送至 ffmpeg-devel 邮件列表

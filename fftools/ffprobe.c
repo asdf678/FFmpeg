@@ -101,55 +101,117 @@ typedef struct InputFile {
     int       nb_streams;
 } InputFile;
 
+#include "ffprobe_api.h"
+
 const char program_name[] = "ffprobe";
 const int program_birth_year = 2007;
 
-static int do_bitexact = 0;
-static int do_count_frames = 0;
-static int do_count_packets = 0;
-static int do_read_frames  = 0;
-static int do_read_packets = 0;
-static int do_show_chapters = 0;
-static int do_show_error   = 0;
-static int do_show_format  = 0;
-static int do_show_frames  = 0;
-static int do_show_packets = 0;
-static int do_show_programs = 0;
-static int do_show_stream_groups = 0;
-static int do_show_stream_group_components = 0;
-static int do_show_streams = 0;
-static int do_show_stream_disposition = 0;
-static int do_show_stream_group_disposition = 0;
-static int do_show_data    = 0;
-static int do_show_program_version  = 0;
-static int do_show_library_versions = 0;
-static int do_show_pixel_formats = 0;
-static int do_show_pixel_format_flags = 0;
-static int do_show_pixel_format_components = 0;
-static int do_show_log = 0;
+/*
+ * State classification (see ffprobe.c header comment for the full picture):
+ *
+ *   (A) Process-wide originals — referenced by `&var` in real_options[].
+ *       Their addresses must be compile-time constants, so they cannot be
+ *       _Thread_local. Written only during parse_options(), then snapshot
+ *       into thread-local copies via ffprobe_snapshot_opts_to_tls() while
+ *       the option-parsing mutex is held. 14 variables in total.
+ *
+ *   (B) Pure thread-locals — assigned by helper opt_* functions (which are
+ *       triggered from cmdutils during parse_options) or computed at
+ *       runtime. Per-task isolation comes for free.
+ *
+ *   (C) Side-array thread-locals for sections[].entries_to_show /
+ *       show_all_entries (see SectionRuntime below). The sections[] array
+ *       itself stays read-only and process-wide; only its mutable per-task
+ *       slots move to TLS.
+ *
+ * Outside this file, every reader of a Class-(A) variable is transparently
+ * redirected to the TLS snapshot via macros declared at the bottom of this
+ * comment block. The redirection is suspended around the real_options[]
+ * definition so cmdutils binds to the original storage.
+ */
 
-static int do_show_chapter_tags = 0;
-static int do_show_format_tags = 0;
-static int do_show_frame_tags = 0;
-static int do_show_program_tags = 0;
-static int do_show_stream_group_tags = 0;
-static int do_show_stream_tags = 0;
-static int do_show_packet_tags = 0;
+/* (A) process-wide originals (referenced by real_options[]). */
+static int  do_bitexact     = 0;
+static int  do_count_frames = 0;
+static int  do_count_packets= 0;
+static int  do_show_data    = 0;
+static int  do_show_log     = 0;
+static int  show_value_unit              = 0;
+static int  use_value_prefix             = 0;
+static int  use_byte_value_binary_prefix = 0;
+static int  use_value_sexagesimal_format = 0;
+static int  show_private_data            = 1;
+static int  find_stream_info             = 1;
+static char *output_format;
+static char *stream_specifier;
+static char *show_data_hash;
 
-static int show_value_unit              = 0;
-static int use_value_prefix             = 0;
-static int use_byte_value_binary_prefix = 0;
-static int use_value_sexagesimal_format = 0;
-static int show_private_data            = 1;
+/* (A) thread-local snapshots — populated by ffprobe_snapshot_opts_to_tls(). */
+static _Thread_local int  do_bitexact_tls     = 0;
+static _Thread_local int  do_count_frames_tls = 0;
+static _Thread_local int  do_count_packets_tls= 0;
+static _Thread_local int  do_show_data_tls    = 0;
+static _Thread_local int  do_show_log_tls     = 0;
+static _Thread_local int  show_value_unit_tls              = 0;
+static _Thread_local int  use_value_prefix_tls             = 0;
+static _Thread_local int  use_byte_value_binary_prefix_tls = 0;
+static _Thread_local int  use_value_sexagesimal_format_tls = 0;
+static _Thread_local int  show_private_data_tls            = 1;
+static _Thread_local int  find_stream_info_tls             = 1;
+static _Thread_local char *output_format_tls;
+static _Thread_local char *stream_specifier_tls;
+static _Thread_local char *show_data_hash_tls;
+
+/* Redirect every reader/writer outside the option table to the TLS copy.
+ * The redirection is temporarily suspended around real_options[] further
+ * below using #undef + redefine. */
+#define do_bitexact                   do_bitexact_tls
+#define do_count_frames               do_count_frames_tls
+#define do_count_packets              do_count_packets_tls
+#define do_show_data                  do_show_data_tls
+#define do_show_log                   do_show_log_tls
+#define show_value_unit               show_value_unit_tls
+#define use_value_prefix              use_value_prefix_tls
+#define use_byte_value_binary_prefix  use_byte_value_binary_prefix_tls
+#define use_value_sexagesimal_format  use_value_sexagesimal_format_tls
+#define show_private_data             show_private_data_tls
+#define find_stream_info              find_stream_info_tls
+#define output_format                 output_format_tls
+#define stream_specifier              stream_specifier_tls
+#define show_data_hash                show_data_hash_tls
+
+/* (B) Pure thread-locals — never bound by &var inside real_options[]. */
+static _Thread_local int do_read_frames  = 0;
+static _Thread_local int do_read_packets = 0;
+static _Thread_local int do_show_chapters = 0;
+static _Thread_local int do_show_error   = 0;
+static _Thread_local int do_show_format  = 0;
+static _Thread_local int do_show_frames  = 0;
+static _Thread_local int do_show_packets = 0;
+static _Thread_local int do_show_programs = 0;
+static _Thread_local int do_show_stream_groups = 0;
+static _Thread_local int do_show_stream_group_components = 0;
+static _Thread_local int do_show_streams = 0;
+static _Thread_local int do_show_stream_disposition = 0;
+static _Thread_local int do_show_stream_group_disposition = 0;
+static _Thread_local int do_show_program_version  = 0;
+static _Thread_local int do_show_library_versions = 0;
+static _Thread_local int do_show_pixel_formats = 0;
+static _Thread_local int do_show_pixel_format_flags = 0;
+static _Thread_local int do_show_pixel_format_components = 0;
+
+static _Thread_local int do_show_chapter_tags = 0;
+static _Thread_local int do_show_format_tags = 0;
+static _Thread_local int do_show_frame_tags = 0;
+static _Thread_local int do_show_program_tags = 0;
+static _Thread_local int do_show_stream_group_tags = 0;
+static _Thread_local int do_show_stream_tags = 0;
+static _Thread_local int do_show_packet_tags = 0;
 
 #define SHOW_OPTIONAL_FIELDS_AUTO       -1
 #define SHOW_OPTIONAL_FIELDS_NEVER       0
 #define SHOW_OPTIONAL_FIELDS_ALWAYS      1
-static int show_optional_fields = SHOW_OPTIONAL_FIELDS_AUTO;
-
-static char *output_format;
-static char *stream_specifier;
-static char *show_data_hash;
+static _Thread_local int show_optional_fields = SHOW_OPTIONAL_FIELDS_AUTO;
 
 typedef struct ReadInterval {
     int id;             ///< identifier
@@ -159,10 +221,8 @@ typedef struct ReadInterval {
     int duration_frames;
 } ReadInterval;
 
-static ReadInterval *read_intervals;
-static int read_intervals_nb = 0;
-
-static int find_stream_info  = 1;
+static _Thread_local ReadInterval *read_intervals;
+static _Thread_local int read_intervals_nb = 0;
 
 /* section structure definition */
 
@@ -236,6 +296,7 @@ typedef enum {
     SECTION_ID_STREAM_SIDE_DATA_LIST,
     SECTION_ID_STREAM_SIDE_DATA,
     SECTION_ID_SUBTITLE,
+    SECTION_ID_NB,                 ///< number of section ids (must stay last)
 } SectionID;
 
 struct section {
@@ -252,10 +313,23 @@ struct section {
     const SectionID children_ids[SECTION_MAX_NB_CHILDREN+1]; ///< list of children section IDS, terminated by -1
     const char *element_name; ///< name of the contained element, if provided
     const char *unique_name;  ///< unique section name, in case the name is ambiguous
-    AVDictionary *entries_to_show;
+    AVDictionary *entries_to_show;       /* unused at runtime; see section_rt[] */
     const char *(* get_type)(const void *data); ///< function returning a type if defined, must be defined when SECTION_FLAG_HAS_TYPE is defined
-    int show_all_entries;
+    int show_all_entries;                /* unused at runtime; see section_rt[] */
 };
+
+/*
+ * Per-task mutable companion to sections[]. Indexed by SectionID. Two
+ * concurrent ffprobe_run() calls each get their own copy.
+ */
+typedef struct SectionRuntime {
+    AVDictionary *entries_to_show;
+    int show_all_entries;
+} SectionRuntime;
+static _Thread_local SectionRuntime section_rt[SECTION_ID_NB];
+
+#define SECTION_RT(s)        (section_rt[(s)->id])
+#define SECTION_RT_ID(sid)   (section_rt[(sid)])
 
 static const char *get_packet_side_data_type(const void *data)
 {
@@ -354,13 +428,13 @@ static struct section sections[] = {
 
 static const OptionDef *options;
 
-/* FFprobe context */
-static const char *input_filename;
-static const char *print_input_filename;
-static const AVInputFormat *iformat = NULL;
-static const char *output_filename = NULL;
+/* FFprobe context (per-task). */
+static _Thread_local const char *input_filename;
+static _Thread_local const char *print_input_filename;
+static _Thread_local const AVInputFormat *iformat = NULL;
+static _Thread_local const char *output_filename = NULL;
 
-static struct AVHashContext *hash;
+static _Thread_local struct AVHashContext *hash;
 
 static const struct {
     double bin_val;
@@ -381,10 +455,10 @@ static const char unit_hertz_str[]          = "Hz"   ;
 static const char unit_byte_str[]           = "byte" ;
 static const char unit_bit_per_second_str[] = "bit/s";
 
-static int nb_streams;
-static uint64_t *nb_streams_packets;
-static uint64_t *nb_streams_frames;
-static int *selected_streams;
+static _Thread_local int nb_streams;
+static _Thread_local uint64_t *nb_streams_packets;
+static _Thread_local uint64_t *nb_streams_frames;
+static _Thread_local int *selected_streams;
 
 #if HAVE_THREADS
 pthread_mutex_t log_mutex;
@@ -400,6 +474,10 @@ typedef struct LogBuffer {
 
 static LogBuffer *log_buffer;
 static int log_buffer_size;
+/* NOTE: log_buffer is a process-wide collector for the av_log callback
+ *       (an avlog callback installation is process-wide). Worker tasks all
+ *       share it; concurrent log ingestion is already serialized via
+ *       log_mutex above. */
 
 static void log_callback(void *ptr, int level, const char *fmt, va_list vl)
 {
@@ -830,7 +908,7 @@ static inline void writer_print_integer(WriterContext *wctx,
 {
     const struct section *section = wctx->section[wctx->level];
 
-    if (section->show_all_entries || av_dict_get(section->entries_to_show, key, NULL, 0)) {
+    if (SECTION_RT(section).show_all_entries || av_dict_get(SECTION_RT(section).entries_to_show, key, NULL, 0)) {
         wctx->writer->print_integer(wctx, key, val);
         wctx->nb_item[wctx->level]++;
     }
@@ -906,7 +984,7 @@ static inline int writer_print_string(WriterContext *wctx,
         && !(wctx->writer->flags & WRITER_FLAG_DISPLAY_OPTIONAL_FIELDS)))
         return 0;
 
-    if (section->show_all_entries || av_dict_get(section->entries_to_show, key, NULL, 0)) {
+    if (SECTION_RT(section).show_all_entries || av_dict_get(SECTION_RT(section).entries_to_show, key, NULL, 0)) {
         if (flags & PRINT_STRING_VALIDATE) {
             char *key1 = NULL, *val1 = NULL;
             ret = validate_string(wctx, &key1, key);
@@ -4219,12 +4297,12 @@ static inline void mark_section_show_entries(SectionID section_id,
 {
     struct section *section = &sections[section_id];
 
-    section->show_all_entries = show_all_entries;
+    SECTION_RT_ID(section_id).show_all_entries = show_all_entries;
     if (show_all_entries) {
         for (const SectionID *id = section->children_ids; *id != -1; id++)
             mark_section_show_entries(*id, show_all_entries, entries);
     } else {
-        av_dict_copy(&section->entries_to_show, entries, 0);
+        av_dict_copy(&SECTION_RT_ID(section_id).entries_to_show, entries, 0);
     }
 }
 
@@ -4561,6 +4639,26 @@ DEFINE_OPT_SHOW_SECTION(streams,          STREAMS)
 DEFINE_OPT_SHOW_SECTION(programs,         PROGRAMS)
 DEFINE_OPT_SHOW_SECTION(stream_groups,    STREAM_GROUPS)
 
+/*
+ * Suspend the TLS-redirection macros so the static option table and the
+ * snapshot routine below can address the underlying process-wide storage.
+ * The macros are restored at the end of this section.
+ */
+#undef do_bitexact
+#undef do_count_frames
+#undef do_count_packets
+#undef do_show_data
+#undef do_show_log
+#undef show_value_unit
+#undef use_value_prefix
+#undef use_byte_value_binary_prefix
+#undef use_value_sexagesimal_format
+#undef show_private_data
+#undef find_stream_info
+#undef output_format
+#undef stream_specifier
+#undef show_data_hash
+
 static const OptionDef real_options[] = {
     CMDUTILS_COMMON_OPTIONS
     { "f",                     OPT_TYPE_FUNC, OPT_FUNC_ARG, {.func_arg = opt_format}, "force format", "format" },
@@ -4612,10 +4710,75 @@ static const OptionDef real_options[] = {
     { NULL, },
 };
 
+/*
+ * Process-wide mutex protecting the option-parsing critical section. Held
+ * only while ffprobe_parse_options() / ffprobe_snapshot_opts_to_tls() run;
+ * the rest of ffprobe_run() (probe / write) executes lock-free.
+ */
+static pthread_mutex_t g_options_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void ffprobe_options_lock  (void) { pthread_mutex_lock  (&g_options_mutex); }
+void ffprobe_options_unlock(void) { pthread_mutex_unlock(&g_options_mutex); }
+
+/*
+ * Move the just-parsed option globals into per-thread snapshots. For string
+ * options ownership is transferred to the TLS copy and the process-wide
+ * pointer is reset to NULL, so the next call to parse_options() starts from
+ * a clean slate without leaking the previous string and without two tasks
+ * sharing the same buffer.
+ */
+void ffprobe_snapshot_opts_to_tls(void)
+{
+    do_bitexact_tls                    = do_bitexact;
+    do_count_frames_tls                = do_count_frames;
+    do_count_packets_tls               = do_count_packets;
+    do_show_data_tls                   = do_show_data;
+    do_show_log_tls                    = do_show_log;
+    show_value_unit_tls                = show_value_unit;
+    use_value_prefix_tls               = use_value_prefix;
+    use_byte_value_binary_prefix_tls   = use_byte_value_binary_prefix;
+    use_value_sexagesimal_format_tls   = use_value_sexagesimal_format;
+    show_private_data_tls              = show_private_data;
+    find_stream_info_tls               = find_stream_info;
+
+    /* Strings: hand off ownership to the TLS copy, reset the global. */
+    av_freep(&output_format_tls);
+    output_format_tls    = output_format;     output_format    = NULL;
+    av_freep(&stream_specifier_tls);
+    stream_specifier_tls = stream_specifier;  stream_specifier = NULL;
+    av_freep(&show_data_hash_tls);
+    show_data_hash_tls   = show_data_hash;    show_data_hash   = NULL;
+
+    /* Reset the integer originals so the next parse_options() starts clean.
+     * (The string ones are already NULL after the move above.) */
+    do_bitexact = do_count_frames = do_count_packets = 0;
+    do_show_data = do_show_log = 0;
+    show_value_unit = use_value_prefix = 0;
+    use_byte_value_binary_prefix = use_value_sexagesimal_format = 0;
+    show_private_data = 1;
+    find_stream_info  = 1;
+}
+
+/* Restore the TLS-redirection macros for the rest of the file. */
+#define do_bitexact                   do_bitexact_tls
+#define do_count_frames               do_count_frames_tls
+#define do_count_packets              do_count_packets_tls
+#define do_show_data                  do_show_data_tls
+#define do_show_log                   do_show_log_tls
+#define show_value_unit               show_value_unit_tls
+#define use_value_prefix              use_value_prefix_tls
+#define use_byte_value_binary_prefix  use_byte_value_binary_prefix_tls
+#define use_value_sexagesimal_format  use_value_sexagesimal_format_tls
+#define show_private_data             show_private_data_tls
+#define find_stream_info              find_stream_info_tls
+#define output_format                 output_format_tls
+#define stream_specifier              stream_specifier_tls
+#define show_data_hash                show_data_hash_tls
+
 static inline int check_section_show_entries(int section_id)
 {
     struct section *section = &sections[section_id];
-    if (sections[section_id].show_all_entries || sections[section_id].entries_to_show)
+    if (SECTION_RT_ID(section_id).show_all_entries || SECTION_RT_ID(section_id).entries_to_show)
         return 1;
     for (const SectionID *id = section->children_ids; *id != -1; id++)
         if (check_section_show_entries(*id))
@@ -4628,7 +4791,86 @@ static inline int check_section_show_entries(int section_id)
             do_show_##varname = 1;                                      \
     } while (0)
 
-int main(int argc, char **argv)
+/*
+ * Reset all file-static state that may have been left dirty by a previous
+ * ffprobe_run() invocation on the same process. Called from ffprobe_api.c
+ * before each task is dispatched.
+ */
+void ffprobe_state_reset(void)
+{
+    do_bitexact = 0;
+    do_count_frames = 0;
+    do_count_packets = 0;
+    do_read_frames  = 0;
+    do_read_packets = 0;
+    do_show_chapters = 0;
+    do_show_error   = 0;
+    do_show_format  = 0;
+    do_show_frames  = 0;
+    do_show_packets = 0;
+    do_show_programs = 0;
+    do_show_stream_groups = 0;
+    do_show_stream_group_components = 0;
+    do_show_streams = 0;
+    do_show_stream_disposition = 0;
+    do_show_stream_group_disposition = 0;
+    do_show_data    = 0;
+    do_show_program_version  = 0;
+    do_show_library_versions = 0;
+    do_show_pixel_formats = 0;
+    do_show_pixel_format_flags = 0;
+    do_show_pixel_format_components = 0;
+    do_show_log = 0;
+
+    do_show_chapter_tags = 0;
+    do_show_format_tags = 0;
+    do_show_frame_tags = 0;
+    do_show_program_tags = 0;
+    do_show_stream_group_tags = 0;
+    do_show_stream_tags = 0;
+    do_show_packet_tags = 0;
+
+    show_value_unit              = 0;
+    use_value_prefix             = 0;
+    use_byte_value_binary_prefix = 0;
+    use_value_sexagesimal_format = 0;
+    show_private_data            = 1;
+    show_optional_fields         = SHOW_OPTIONAL_FIELDS_AUTO;
+
+    av_freep(&output_format);
+    av_freep(&stream_specifier);
+    av_freep(&show_data_hash);
+
+    av_freep(&read_intervals);
+    read_intervals_nb = 0;
+
+    find_stream_info = 1;
+
+    nb_streams = 0;
+    av_freep(&nb_streams_packets);
+    av_freep(&nb_streams_frames);
+    av_freep(&selected_streams);
+
+    /* per-section dictionaries set up by -show_entries (TLS, per task) */
+    for (size_t i = 0; i < SECTION_ID_NB; i++) {
+        av_dict_free(&section_rt[i].entries_to_show);
+        section_rt[i].show_all_entries = 0;
+    }
+}
+
+/*
+ * Body of main() – re-entrant so it can be driven from ffprobe_api.c on a
+ * worker thread. Process-wide one-shot init (network, devices, dynload)
+ * happens in ffprobe_api.c via pthread_once.
+ *
+ * Concurrency: the option-parsing phase is serialized via g_options_mutex
+ * because parse_options() writes a handful of process-wide variables that
+ * the static real_options[] table addresses by &var. Right after parsing
+ * completes we snapshot those globals into thread-local copies and then
+ * unlock; the rest of ffprobe_run() (probe_file + writing) runs lock-free
+ * and concurrent ffprobe_run() invocations execute in true parallel.
+ */
+int ffprobe_run(int argc, char **argv)
 {
     const Writer *w;
     WriterContext *wctx;
@@ -4636,25 +4878,20 @@ int main(int argc, char **argv)
     char *w_name = NULL, *w_args = NULL;
     int ret, input_ret, i;
 
-    init_dynload();
-
-#if HAVE_THREADS
-    ret = pthread_mutex_init(&log_mutex, NULL);
-    if (ret != 0) {
-        goto end;
-    }
-#endif
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
 
     options = real_options;
     parse_loglevel(argc, argv, options);
-    avformat_network_init();
-#if CONFIG_AVDEVICE
-    avdevice_register_all();
-#endif
 
     show_banner(argc, argv, options);
+
+    /* Phase 1 — option parsing: serialized via g_options_mutex. */
+    ffprobe_options_lock();
     ret = parse_options(NULL, argc, argv, options, opt_input_file);
+    if (ret >= 0)
+        ffprobe_snapshot_opts_to_tls();
+    ffprobe_options_unlock();
+
     if (ret < 0) {
         ret = (ret == AVERROR_EXIT) ? 0 : ret;
         goto end;
@@ -4778,6 +5015,9 @@ int main(int argc, char **argv)
     }
 
 end:
+    if (ret < 0)
+        ffprobe_task_emit_error(ret, "ffprobe_run failed");
+
     av_freep(&output_format);
     av_freep(&output_filename);
     av_freep(&input_filename);
@@ -4786,8 +5026,36 @@ end:
     av_hash_freep(&hash);
 
     uninit_opts();
-    for (i = 0; i < FF_ARRAY_ELEMS(sections); i++)
-        av_dict_free(&(sections[i].entries_to_show));
+    for (i = 0; i < SECTION_ID_NB; i++)
+        av_dict_free(&section_rt[i].entries_to_show);
+
+    return ret;
+}
+
+/*
+ * The CLI entry point. Compile with -DFFPROBE_DRIVER_NO_MAIN to omit it
+ * when embedding the engine into another program that supplies its own
+ * main() (see fftools/ffprobe_api_demo.c).
+ */
+#ifndef FFPROBE_DRIVER_NO_MAIN
+int main(int argc, char **argv)
+{
+    int ret;
+
+    init_dynload();
+
+#if HAVE_THREADS
+    ret = pthread_mutex_init(&log_mutex, NULL);
+    if (ret != 0)
+        return ret < 0 ? 1 : 0;
+#endif
+
+    avformat_network_init();
+#if CONFIG_AVDEVICE
+    avdevice_register_all();
+#endif
+
+    ret = ffprobe_run(argc, argv);
 
     avformat_network_deinit();
 
@@ -4797,3 +5065,4 @@ end:
 
     return ret < 0;
 }
+#endif /* FFPROBE_DRIVER_NO_MAIN */
